@@ -8,6 +8,7 @@ from typing import Literal, Optional, List, Dict, Any, Type
 
 MAX_REPLANS = 2
 
+
 # Custom State class with specific keys
 class State(MessagesState):
     enabled_agents: Optional[List[str]]
@@ -21,7 +22,9 @@ class State(MessagesState):
     replan_attempts: Optional[Dict[int, int]]
     agent_query: Optional[str]
 
+
 MAX_REPLANS = 2
+
 
 def get_agent_descriptions() -> Dict[str, Dict[str, Any]]:
     """
@@ -66,29 +69,52 @@ def get_agent_descriptions() -> Dict[str, Dict[str, Any]]:
             "output_format": "Coherent written summary incorporating all findings",
             "position_requirement": "Should be used as final step when no chart is needed",
         },
-        "cosmos_data": {
+        "cosmos_route": {
             "name": "Cosmos data",
-            "capability": "Query data in Azure cosmos data",
-            "use_when": "User want to query data from cosmos data",
-            "limitations": "Cannot edit or delete data in the database",
-        }
+            "capability": "Query data in Azure cosmos route data",
+            "use_when": "User want to query data from cosmos route data",
+            "limitations": """
+                Cannot create, modify, or delete data in the database.
+                Cannot retrieve raw record-level data unless it is required to answer the user's request.
+                Must minimize data retrieval and access only the information necessary to complete the task.
+        """,
+        },
     }
+
 
 def _get_enabled_agents(state: State | None = None) -> List[str]:
     """Return enabled agents; if absent, use baseline/default.
 
     Supports both dict-style and attribute-style state objects.
     """
-    baseline = ["web_researcher", "chart_generator", "chart_summarizer", "synthesizer", "cosmos_data"]
+    baseline = [
+        "web_researcher",
+        "chart_generator",
+        "chart_summarizer",
+        "synthesizer",
+        "cosmos_route",
+    ]
     if not state:
         return baseline
-    val = state.get("enabled_agents") if hasattr(state, "get") else getattr(state, "enabled_agents", None)
-    
+    val = (
+        state.get("enabled_agents")
+        if hasattr(state, "get")
+        else getattr(state, "enabled_agents", None)
+    )
+
     if isinstance(val, list) and val:
-        allowed = {"web_researcher", "cortex_researcher", "chart_generator", "chart_summarizer", "synthesizer", "cosmos_data"}
+        allowed = {
+            "web_researcher",
+            "cortex_researcher",
+            "chart_generator",
+            "chart_summarizer",
+            "synthesizer",
+            "cosmos_route",
+        }
         filtered = [a for a in val if a in allowed]
         return filtered
     return baseline
+
 
 def format_agent_list_for_planning(state: State | None = None) -> str:
     """
@@ -97,13 +123,14 @@ def format_agent_list_for_planning(state: State | None = None) -> str:
     descriptions = get_agent_descriptions()
     enabled_list = _get_enabled_agents(state)
     agent_list = []
-    
+
     for agent_key, details in descriptions.items():
         if agent_key not in enabled_list:
             continue
         agent_list.append(f"  • `{agent_key}` – {details['capability']}")
-    
+
     return "\n".join(agent_list)
+
 
 def format_agent_guidelines_for_planning(state: State | None = None) -> str:
     """
@@ -112,28 +139,43 @@ def format_agent_guidelines_for_planning(state: State | None = None) -> str:
     descriptions = get_agent_descriptions()
     enabled = set(_get_enabled_agents(state))
     guidelines = []
-    
+
     # Cortex vs Web researcher (only include guidance for enabled agents)
     if "cortex_researcher" in enabled:
-        guidelines.append(f"- Use `cortex_researcher` when {descriptions['cortex_researcher']['use_when'].lower()}.")
+        guidelines.append(
+            f"- Use `cortex_researcher` when {descriptions['cortex_researcher']['use_when'].lower()}."
+        )
     if "web_researcher" in enabled:
-        guidelines.append(f"- Use `web_researcher` for {descriptions['web_researcher']['use_when'].lower()}.")
+        guidelines.append(
+            f"- Use `web_researcher` for {descriptions['web_researcher']['use_when'].lower()}."
+        )
 
     # cosmos data
-    if "cosmos_data" in enabled:
-        guidelines.append(f"- Use `cosmos_data` when {descriptions['cosmos_data']['use_when'].lower()}.")
-        
+    if "cosmos_route" in enabled:
+        guidelines.append(
+            f"- Use `cosmos_route` when {descriptions['cosmos_route']['use_when'].lower()}."
+        )
+
     # Chart generator specific rules
     if "chart_generator" in enabled:
-        chart_desc = descriptions['chart_generator']
-        cs_hint = " A `chart_summarizer` should be used to summarize the chart." if "chart_summarizer" in enabled else ""
-        guidelines.append(f"- **Include `chart_generator` _only_ if {chart_desc['use_when'].lower()}**. If included, `chart_generator` must be {chart_desc['position_requirement'].lower()}. Visualizations should include all of the data from the previous steps that is reasonable for the chart type.{cs_hint}")
-    
+        chart_desc = descriptions["chart_generator"]
+        cs_hint = (
+            " A `chart_summarizer` should be used to summarize the chart."
+            if "chart_summarizer" in enabled
+            else ""
+        )
+        guidelines.append(
+            f"- **Include `chart_generator` _only_ if {chart_desc['use_when'].lower()}**. If included, `chart_generator` must be {chart_desc['position_requirement'].lower()}. Visualizations should include all of the data from the previous steps that is reasonable for the chart type.{cs_hint}"
+        )
+
     # Synthesizer default
     if "synthesizer" in enabled:
-        synth_desc = descriptions['synthesizer'] 
-        guidelines.append(f"  – Otherwise use `synthesizer` as {synth_desc['position_requirement'].lower()}, and be sure to include all of the data from the previous steps.")
+        synth_desc = descriptions["synthesizer"]
+        guidelines.append(
+            f"  – Otherwise use `synthesizer` as {synth_desc['position_requirement'].lower()}, and be sure to include all of the data from the previous steps."
+        )
     return "\n".join(guidelines)
+
 
 def format_agent_guidelines_for_executor(state: State | None = None) -> str:
     """
@@ -142,29 +184,36 @@ def format_agent_guidelines_for_executor(state: State | None = None) -> str:
     descriptions = get_agent_descriptions()
     enabled = _get_enabled_agents(state)
     guidelines = []
-    
+
     if "web_researcher" in enabled:
-        web_desc = descriptions['web_researcher']
-        guidelines.append(f"- Use `\"web_researcher\"` when {web_desc['use_when'].lower()}.")
+        web_desc = descriptions["web_researcher"]
+        guidelines.append(
+            f"- Use `\"web_researcher\"` when {web_desc['use_when'].lower()}."
+        )
     if "cortex_researcher" in enabled:
-        cortex_desc = descriptions['cortex_researcher']
-        guidelines.append(f"- Use `\"cortex_researcher\"` for {cortex_desc['use_when'].lower()}.")
-    if "cosmos_data" in enabled:
-        cosmos_data_desc = descriptions['cosmos_data']
-        guidelines.append(f"- Use `\"cosmos_data\"` when {cosmos_data_desc['use_when'].lower()}.")
+        cortex_desc = descriptions["cortex_researcher"]
+        guidelines.append(
+            f"- Use `\"cortex_researcher\"` for {cortex_desc['use_when'].lower()}."
+        )
+    if "cosmos_route" in enabled:
+        cosmos_route_desc = descriptions["cosmos_route"]
+        guidelines.append(
+            f"- Use `\"cosmos_route\"` when {cosmos_route_desc['use_when'].lower()}."
+        )
     return "\n".join(guidelines)
+
 
 def plan_prompt(state: State) -> HumanMessage:
     """
     Build the prompt that instructs the LLM to return a high‑level plan.
     """
-    replan_flag   = state.get("replan_flag", False)
-    user_query    = state.get("user_query", state["messages"][0].content)
-    prior_plan    = state.get("plan") or {}
+    replan_flag = state.get("replan_flag", False)
+    user_query = state.get("user_query", state["messages"][0].content)
+    prior_plan = state.get("plan") or {}
     replan_reason = state.get("last_reason", "")
-    
+
     # Get agent descriptions dynamically
-    
+
     agent_list = format_agent_list_for_planning(state)
     agent_guidelines = format_agent_guidelines_for_planning(state)
 
@@ -172,10 +221,21 @@ def plan_prompt(state: State) -> HumanMessage:
 
     # Build planner agent enum based on enabled agents
     enabled_for_planner = [
-        a for a in enabled_list
-        if a in ("web_researcher", "cortex_researcher", "chart_generator", "synthesizer", "cosmos_data")
+        a
+        for a in enabled_list
+        if a
+        in (
+            "web_researcher",
+            "cortex_researcher",
+            "chart_generator",
+            "synthesizer",
+            "cosmos_route",
+        )
     ]
-    planner_agent_enum = " | ".join(enabled_for_planner) or "web_researcher | chart_generator | synthesizer | cosmos_data"
+    planner_agent_enum = (
+        " | ".join(enabled_for_planner)
+        or "web_researcher | chart_generator | synthesizer | cosmos_route"
+    )
 
     prompt = f"""
         You are the **Planner** in a multi‑agent system.  Break the user's request into a sequence of numbered steps (1, 2, 3, …).
@@ -188,6 +248,8 @@ def plan_prompt(state: State) -> HumanMessage:
         2. Fetch a recent news story for the first action item.
         3. Fetch a recent news story for the second action item.
         4. Fetch a recent news story for the last action item
+        If you need to use the agent to query data, do not retrieve raw record-level data unless it is required to answer the user's request,
+        must minimize data retrieval and access only the information necessary to complete the task
         Here is a list of available agents you can call upon to execute the tasks in your plan. You may call only one agent per step.
         {agent_list}
         Return ONLY valid JSON format (no markdown, no explanations, no texts) in this form:
@@ -220,8 +282,9 @@ def plan_prompt(state: State) -> HumanMessage:
         prompt += "\nGenerate a new plan from scratch."
 
     prompt += f'\nUser query: "{user_query}"'
-    
+
     return HumanMessage(content=prompt)
+
 
 def executor_prompt(state: State) -> HumanMessage:
     """
@@ -230,9 +293,9 @@ def executor_prompt(state: State) -> HumanMessage:
     step = int(state.get("current_step", 0))
     latest_plan: Dict[str, Any] = state.get("plan") or {}
     plan_block: Dict[str, Any] = latest_plan.get(str(step), {})
-    max_replans    = MAX_REPLANS
-    attempts       = (state.get("replan_attempts", {}) or {}).get(step, 0)
-    
+    max_replans = MAX_REPLANS
+    attempts = (state.get("replan_attempts", {}) or {}).get(step, 0)
+
     # Get agent guidelines dynamically
     executor_guidelines = format_agent_guidelines_for_executor(state)
     plan_agent = plan_block.get("agent", "web_researcher")
@@ -241,7 +304,7 @@ def executor_prompt(state: State) -> HumanMessage:
 
     executor_prompt = f"""
         You are the **executor** in a multi‑agent system with these agents:
-        `{ '`, `'.join(sorted(set([a for a in _get_enabled_agents(state) if a in ['web_researcher','cortex_researcher','chart_generator','chart_summarizer','synthesizer', 'cosmos_data']] + ['planner']))) }`.
+        `{ '`, `'.join(sorted(set([a for a in _get_enabled_agents(state) if a in ['web_researcher','cortex_researcher','chart_generator','chart_summarizer','synthesizer', 'cosmos_route']] + ['planner']))) }`.
 
         **Tasks**
         1. Decide if the current plan needs revision.  → `"replan_flag": true|false`
@@ -260,7 +323,7 @@ def executor_prompt(state: State) -> HumanMessage:
 
         {{
         "replan": <true|false>,
-        "goto": "<{ '|'.join([a for a in _get_enabled_agents(state) if a in ['web_researcher','cortex_researcher','chart_generator','chart_summarizer','synthesizer', 'cosmos_data']] + ['planner']) }>",
+        "goto": "<{ '|'.join([a for a in _get_enabled_agents(state) if a in ['web_researcher','cortex_researcher','chart_generator','chart_summarizer','synthesizer', 'cosmos_route']] + ['planner']) }>",
         "reason": "<1 sentence>",
         "query": "<text>"
         }}
@@ -295,9 +358,8 @@ def executor_prompt(state: State) -> HumanMessage:
         Respond **only** with JSON, no extra text.
         """
 
-    return HumanMessage(
-        content=executor_prompt
-    )
+    return HumanMessage(content=executor_prompt)
+
 
 def agent_system_prompt(suffix: str) -> str:
     return (

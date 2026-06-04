@@ -12,11 +12,11 @@ from langchain_community.utilities.tavily_search import TavilySearchAPIWrapper
 from langchain_community.tools.tavily_search import TavilySearchResults
 from langgraph.prebuilt import ToolNode
 from llmclean import strip_fences
+import matplotlib.pyplot as plt
 from azure.cosmos import CosmosClient
-from cosmos_agent import CosmosDataAgent
-from prompts import plan_prompt
-from prompts import executor_prompt
-from helper import agent_system_prompt, python_repl_tool
+from cosmos_agent import CosmosRouteAgent
+from prompts import plan_prompt, executor_prompt, agent_system_prompt
+from helper import python_repl_tool
 #
 from dotenv import load_dotenv
 load_dotenv()
@@ -38,22 +38,23 @@ class State(MessagesState):
     last_reason: Optional[str] # Explains the executor’s decision to help maintain continuity and provide traceability.
     replan_flag: Optional[bool] # Set by the executor to indicate that the planner should revise the plan.
     replan_attempts: Optional[Dict[int, Dict[int, int]]] # Replan attempts tracked per step number.
+    chart_b64: Optional[str] # data URI of the cosmos agent's chart, for the front-end
 #
-reasoning_llm = ChatOpenAI(
-    model="gemini-2.5-flash-lite", # Gemini 3.1 Flash Lite
-    openai_api_key=openai_key,
-    openai_api_base="https://generativelanguage.googleapis.com/v1beta/openai/",
-    max_tokens=2048,
-    temperature=0.1
-)
-
 # reasoning_llm = ChatOpenAI(
-#     model="DeepSeek-V4-Flash",  # gpt-5.4-mini, DeepSeek-V4-Flash
-#     base_url="https://3t-ai-resource.services.ai.azure.com/openai/v1",
-#     api_key=azure_openai_key,
+#     model="gemini-2.5-flash-lite", # Gemini 3.1 Flash Lite
+#     openai_api_key=openai_key,
+#     openai_api_base="https://generativelanguage.googleapis.com/v1beta/openai/",
 #     max_tokens=2048,
 #     temperature=0.1
 # )
+
+reasoning_llm = ChatOpenAI(
+    model="DeepSeek-V4-Flash",  # gpt-5.4-mini, DeepSeek-V4-Flash
+    base_url="https://3t-ai-resource.services.ai.azure.com/openai/v1",
+    api_key=azure_openai_key,
+    max_tokens=2048,
+    temperature=0.1
+)
 #
 def planner_node(state: State) -> Command[Literal['executor']]:
     """
@@ -290,7 +291,7 @@ def synthesizer_node(state: State) -> Command[Literal[END]]:
         goto=END,           # hand off to the END node
     )
 #
-cosmos_agent_instance = CosmosDataAgent(
+cosmos_route_agent = CosmosRouteAgent(
     endpoint=ENDPOINT,
     key=KEY,
     database_name="hgs-output",
@@ -320,7 +321,7 @@ def token_summary(final_state):
 workflow = StateGraph(State)
 workflow.add_node("planner", planner_node)
 workflow.add_node("executor", executor_node)
-workflow.add_node("cosmos_data", cosmos_agent_instance.node)
+workflow.add_node("cosmos_route", cosmos_route_agent.node)
 workflow.add_node("web_researcher", web_research_node)
 workflow.add_node("chart_generator", chart_node)
 workflow.add_node("chart_summarizer", chart_summary_node)
@@ -338,11 +339,26 @@ April 10: 15 routes
 state = {
     "messages": [HumanMessage(content=query)],
     "user_query": query,
-    "enabled_agents": ["web_researcher", "chart_generator", "chart_summarizer", "synthesizer", "cosmos_data"],
+    "enabled_agents": ["cosmos_route"],
         }
+import base64
 final_state = graph.invoke(state)
 final_answer = final_state["messages"][-1].content
 print(final_answer)
 print("--------------------------------")
-print(final_state)
 token_summary(final_state)
+# Display the chart inline if the cosmos agent produced one
+chart_b64 = final_state.get("chart_b64")
+if chart_b64:
+    chart_path = os.path.join(os.path.dirname(__file__), "chart_output.png")
+    with open(chart_path, "wb") as f:
+        f.write(base64.b64decode(chart_b64.split(",", 1)[1]))
+    print(f"\n--- Chart saved to {chart_path} ---")
+    img = plt.imread(chart_path)
+    plt.imshow(img)
+    plt.show()
+else:
+    print("(No chart produced)")
+
+
+
