@@ -14,7 +14,7 @@ from langgraph.prebuilt import ToolNode
 from llmclean import strip_fences
 import matplotlib.pyplot as plt
 from azure.cosmos import CosmosClient
-from cosmos_agent import CosmosRouteAgent
+from cosmos_agent import CosmosRouteAgent, CosmosOrderAgent
 from prompts import plan_prompt, executor_prompt, agent_system_prompt
 from helper import python_repl_tool
 #
@@ -81,7 +81,8 @@ def planner_node(state: State) -> Command[Literal['executor']]:
             "messages": [HumanMessage(
                 content=llm_reply.content,
                 name="replan" if replan else "initial_plan")],
-            "user_query": state.get("user_query", state["messages"][0].content),"current_step": 1 if not replan else state["current_step"],
+            "user_query": state.get("user_query", state["messages"][0].content),
+            "current_step": 1 if not replan else state["current_step"],
             # Preserve replan flag so executor runs planned agent once before reconsidering
             "replan_flag": state.get("replan_flag", False),
             "last_reason": "",
@@ -89,17 +90,17 @@ def planner_node(state: State) -> Command[Literal['executor']]:
         },
         goto="executor",
     )
+
 #
 def executor_node(
     state: State,
     MAX_REPLANS=3
-) -> Command[Literal["web_researcher", "chart_generator", "synthesizer", "planner"]]:
+) -> Command[Literal["planner", "cosmos_order", "cosmos_route", "synthesizer"]]:
 
     plan: Dict[str, Any] = state.get("plan", {})
     step: int = state.get("current_step", 1)
 
-    # 0) If we *just* replanned, 
-    # run the planned agent once before reconsidering.
+    # 0) If we *just* replanned, run the planned agent once before reconsidering.
     if state.get("replan_flag"):
         planned_agent = plan.get(str(step), {}).get("agent")
         return Command(
@@ -156,89 +157,8 @@ def executor_node(
     updates["current_step"] = step + 1 if goto == planned_agent else step
     updates["replan_flag"] = False
     return Command(update=updates, goto=goto)
-#
-wrapper = TavilySearchAPIWrapper(tavily_api_key=tavily_key)
-tavily_tool = TavilySearchResults(api_wrapper=wrapper, max_results=5)
-web_search_agent = create_agent(
-    reasoning_llm,
-    tools=[tavily_tool],
-    system_prompt=agent_system_prompt(f"""
-        You are the Researcher. You can ONLY perform research by using the provided search tool (tavily_tool). 
-        When you have found the necessary information, end your output.  
-        Do NOT attempt to take further actions.
-    """),
-)
-#
-def web_research_node(state: State,) -> Command[Literal["executor"]]:
-    agent_query = state.get("agent_query")
-    result = web_search_agent.invoke({"messages":agent_query})
-    goto = "executor"
-    # wrap in a human message, as not all providers allow
-    # AI message at the last position of the input messages list
-    result["messages"][-1] = HumanMessage(content=result["messages"][-1].content, name="web_researcher")
-    return Command(
-        update={
-            # share internal message history of research agent with other agents
-            "messages": result["messages"],
-        },
-        goto=goto,
-    )
-#
-chart_agent = create_agent(reasoning_llm,
-                                 tools=[python_repl_tool],
-                                 system_prompt=agent_system_prompt(
-        """
-        You can only generate charts. You are working with a researcher colleague.
-        1) Print the chart first.
-        2) Save the chart to a file in the current working directory.
-        3) At the very end of your message, output EXACTLY two lines so the summarizer can find them:
-           CHART_PATH: <relative_path_to_chart_file>
-           CHART_NOTES: <one concise sentence summarizing the main insight in the chart>
-        Do not include any other trailing text after these two lines.
-        """
-    ),
-)
-#
-def chart_node(state: State) -> Command[Literal["chart_summarizer"]]:
-    result = chart_agent.invoke(state)
-    # wrap in a human message, as not all providers allow
-    # AI message at the last position of the input messages list
-    result["messages"][-1] = HumanMessage(content=result["messages"][-1].content, name="chart_generator")
-    goto="chart_summarizer"
-    return Command(
-        update={
-            # share internal message history of chart agent with other agents
-            "messages": result["messages"],
-        },
-        goto=goto,
-    )
-#
-chart_summary_agent = create_agent(reasoning_llm,
-                                         tools=[],  # Add image processing tools if available/needed.
-                                         system_prompt=agent_system_prompt(
-     """
-     You can only generate image captions. You are working with a researcher colleague and a chart generator colleague.
-     Your task is to generate a standalone, concise summary for the provided chart image saved at a local PATH,
-     where the PATH should be and only be provided by your chart generator colleague.
-     The summary should be no more than 3 sentences and should not mention the chart itself."
-     """
-        
-    ),
-)
-#
-def chart_summary_node(state: State) -> Command[Literal[END]]:
-    result = chart_summary_agent.invoke(state)
-    print(f"Chart summarizer answer: {result['messages'][-1].content}")
-    # Send to the end node
-    goto = END
-    return Command(
-        update={
-            # share internal message history of chart agent with other agents
-            "messages": result["messages"],
-            "final_answer": result["messages"][-1].content,
-        },
-        goto=goto,
-    )
+
+
 #
 def synthesizer_node(state: State) -> Command[Literal[END]]:
     """
@@ -248,9 +168,8 @@ def synthesizer_node(state: State) -> Command[Literal[END]]:
     # Gather informative messages for final synthesis
     relevant_msgs = [
         m.content for m in state.get("messages", [])
-        if getattr(m, "name", None) in ("web_researcher", 
-                                        "chart_generator", 
-                                        "chart_summarizer")
+        if getattr(m, "name", None) in ("cosmos_order", 
+                                        "cosmos_route")
     ]
     print("="*100)
     print(json.dumps(state, indent=4))
@@ -290,7 +209,17 @@ def synthesizer_node(state: State) -> Command[Literal[END]]:
         },
         goto=END,           # hand off to the END node
     )
+
+
 #
+cosmos_order_agent = CosmosOrderAgent(
+    endpoint=ENDPOINT,
+    key=KEY,
+    database_name="hgs-input",
+    container_name="orders",
+    llm=reasoning_llm
+)
+
 cosmos_route_agent = CosmosRouteAgent(
     endpoint=ENDPOINT,
     key=KEY,
@@ -298,6 +227,7 @@ cosmos_route_agent = CosmosRouteAgent(
     container_name="route",
     llm=reasoning_llm
 )
+
 #
 def token_summary(final_state):
     total_input_tokens = 0
@@ -321,20 +251,21 @@ def token_summary(final_state):
 workflow = StateGraph(State)
 workflow.add_node("planner", planner_node)
 workflow.add_node("executor", executor_node)
+workflow.add_node("cosmos_order", cosmos_order_agent.node)
 workflow.add_node("cosmos_route", cosmos_route_agent.node)
-workflow.add_node("web_researcher", web_research_node)
-workflow.add_node("chart_generator", chart_node)
-workflow.add_node("chart_summarizer", chart_summary_node)
 workflow.add_node("synthesizer", synthesizer_node)
 workflow.add_edge(START, "planner")
 graph = workflow.compile()
 #
+# query = """
+# Calculate the average number of routes planned each calendar day for April 2026, do not return only the overall average and follow output example below. Visualize the results by a line chart.
+# <Example output from query>
+# April 8: 8 routes
+# April 10: 15 routes
+# <Example output from query>
+# """
 query = """
-Calculate the average number of routes planned each calendar day for April 2026, do not return only the overall average and follow output example below. Visualize the results by a line chart.
-<Example output from query>
-April 8: 8 routes
-April 10: 15 routes
-<Example output from query>
+Give me the number of routes for the request id: cd847bd2-84d1-4132-83b9-f36b3e490a66
 """
 state = {
     "messages": [HumanMessage(content=query)],
@@ -349,6 +280,9 @@ print("--------------------------------")
 token_summary(final_state)
 # Display the chart inline if the cosmos agent produced one
 chart_b64 = final_state.get("chart_b64")
+print(chart_b64)
+print("="*150)
+print(final_state)
 if chart_b64:
     chart_path = os.path.join(os.path.dirname(__file__), "chart_output.png")
     with open(chart_path, "wb") as f:

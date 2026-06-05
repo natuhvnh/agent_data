@@ -1,33 +1,47 @@
 import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
 from datetime import datetime
 
-# Data
-dates = [datetime(2026, 4, 17), datetime(2026, 4, 18)]
-route_counts = [11, 6]
+data = [
+    {"col_date": "2026-04-17T00:00:00", "route_count": 7},
+    {"col_date": "2026-04-18T00:00:00", "route_count": 6},
+    {"col_date": "2026-04-17T00:00:00", "route_count": 4},
+    {"col_date": "2026-04-16T00:00:00", "route_count": 4},
+    {"col_date": "2026-04-16T00:00:00", "route_count": 22},
+    {"col_date": "2026-04-16T00:00:00", "route_count": 21}
+]
 
-# Create the plot
+# Aggregate by date
+from collections import defaultdict
+daily_totals = defaultdict(int)
+for d in data:
+    date_str = d["col_date"][:10]  # Extract YYYY-MM-DD
+    daily_totals[date_str] += d["route_count"]
+
+# Sort by date
+sorted_dates = sorted(daily_totals.keys())
+sorted_counts = [daily_totals[d] for d in sorted_dates]
+
+# Calculate average
+avg_routes = sum(sorted_counts) / len(sorted_counts)
+
+print("Daily route counts:")
+for d, c in zip(sorted_dates, sorted_counts):
+    # Format as "April 16: 47" etc.
+    dt = datetime.strptime(d, "%Y-%m-%d")
+    month_day = dt.strftime("%B %-d")
+    print(f"{month_day}: {c}")
+
+print(f"\nAverage number of routes per day: {avg_routes:.2f}")
+
+# Create line chart
 plt.figure(figsize=(10, 6))
-plt.plot(dates, route_counts, marker='o', linestyle='-', color='b', linewidth=2, markersize=8)
-
-# Formatting
-plt.title('Number of Routes Planned per Day - April 2026', fontsize=14)
-plt.xlabel('Date', fontsize=12)
-plt.ylabel('Number of Routes', fontsize=12)
+dates_formatted = [datetime.strptime(d, "%Y-%m-%d").strftime("%b %-d") for d in sorted_dates]
+plt.plot(dates_formatted, sorted_counts, marker='o', linestyle='-', color='b', linewidth=2, markersize=8)
+plt.xlabel('Date')
+plt.ylabel('Number of Routes')
+plt.title('Number of Routes Planned per Day in April 2026')
 plt.grid(True, linestyle='--', alpha=0.7)
-
-# Format x-axis dates
-plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%b %d'))
-plt.gca().xaxis.set_major_locator(mdates.DayLocator())
 plt.xticks(rotation=45)
-
-# Set y-axis to integer ticks
-plt.yticks(range(0, max(route_counts) + 2, 1))
-
-# Add data labels
-for i, (d, c) in enumerate(zip(dates, route_counts)):
-    plt.text(d, c + 0.3, str(c), ha='center', fontsize=11)
-
 plt.tight_layout()
-plt.savefig('april_2026_routes_per_day.png', dpi=150)
-plt.show()
+plt.savefig('april_2026_routes_per_day.png')
+print("\nChart saved as april_2026_routes_per_day.png")
