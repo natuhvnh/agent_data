@@ -1,6 +1,9 @@
 import os
 import json
-from typing import Literal, Optional, List, Dict, Any, Type
+import time
+import functools
+import operator
+from typing import Annotated, Literal, Optional, List, Dict, Any, Type
 from langchain.agents import create_agent
 from langgraph.graph import MessagesState, END, START, StateGraph
 from langgraph.types import Command
@@ -39,6 +42,7 @@ class State(MessagesState):
     replan_flag: Optional[bool] # Set by the executor to indicate that the planner should revise the plan.
     replan_attempts: Optional[Dict[int, Dict[int, int]]] # Replan attempts tracked per step number.
     chart_b64: Optional[str] # data URI of the cosmos agent's chart, for the front-end
+    node_timings: Annotated[List[Dict[str, Any]], operator.add] # per-node wall-time records
 #
 # reasoning_llm = ChatOpenAI(
 #     model="gemini-2.5-flash-lite", # Gemini 3.1 Flash Lite
@@ -100,13 +104,17 @@ def executor_node(
     plan: Dict[str, Any] = state.get("plan", {})
     step: int = state.get("current_step", 1)
 
+    # All plan steps executed — hand off to synthesizer
+    if step > len(plan):
+        return Command(update={"current_step": step}, goto="synthesizer")
+
     # 0) If we *just* replanned, run the planned agent once before reconsidering.
     if state.get("replan_flag"):
         planned_agent = plan.get(str(step), {}).get("agent")
         return Command(
             update={
                 "replan_flag": False,
-                "current_step": step + 1,  # advance because we executed the planned agent
+                "current_step": step + 1,  # advance because executed the planned agent
             },
             goto=planned_agent,
         )
@@ -171,9 +179,6 @@ def synthesizer_node(state: State) -> Command[Literal[END]]:
         if getattr(m, "name", None) in ("cosmos_order", 
                                         "cosmos_route")
     ]
-    print("="*100)
-    print(json.dumps(state, indent=4))
-
     user_question = state.get("user_query", state.get("messages", [{}])[0].content if state.get("messages") else "")
     synthesis_instructions = (
         """
@@ -181,12 +186,12 @@ def synthesizer_node(state: State) -> Command[Literal[END]]:
         Perform any lightweight calculations, comparisons, or inferences required.
         Do not invent facts not supported by the context.
         If data is missing, say what's missing and, if helpful, offer a clearly labeled best-effort estimate with assumptions.
-        Produce a concise response that fully answers the question, with 
-        the following guidance:
+        Produce a concise response that fully answers the question, with the following guidance:
         - Start with the direct answer (one short paragraph or a tight bullet list).\n
         - Include key figures from any 'Results:' tables (e.g., totals, top items).\n
         - If any message contains citations, include them as a brief 'Citations: [...]' line.\n
         - Keep the output crisp; avoid meta commentary or tool instructions.
+        - Return plain text only, do not use markdown.
         """
         )
     summary_prompt = [
@@ -248,39 +253,67 @@ def token_summary(final_state):
     print(f"Total Tokens:  {total_input_tokens + total_output_tokens}")
     return
 #
+def timed_node(name: str, fn):
+    """Wraps a node function to record its wall-clock execution time into state."""
+    @functools.wraps(fn)
+    def wrapper(state):
+        start = time.perf_counter()
+        result = fn(state)
+        elapsed = time.perf_counter() - start
+        print(f"[timing] {name}: {elapsed:.2f}s")
+        if isinstance(result, Command):
+            if result.update is None:
+                result.update = {}
+            result.update["node_timings"] = [{"node": name, "seconds": elapsed}]
+        return result
+    return wrapper
+
+#
+def timing_summary(final_state, total_seconds=None):
+    timings = final_state.get("node_timings") or []
+    print("--- Node Execution Times ---")
+    for rec in timings:
+        print(f"{rec['node']}: {rec['seconds']:.2f}s")
+    print(f"Sum of node times: {sum(r['seconds'] for r in timings):.2f}s")
+    if total_seconds is not None:
+        print(f"Total run time:    {total_seconds:.2f}s")
+
+#
 workflow = StateGraph(State)
-workflow.add_node("planner", planner_node)
-workflow.add_node("executor", executor_node)
-workflow.add_node("cosmos_order", cosmos_order_agent.node)
-workflow.add_node("cosmos_route", cosmos_route_agent.node)
-workflow.add_node("synthesizer", synthesizer_node)
+workflow.add_node("planner", timed_node("planner", planner_node))
+workflow.add_node("executor", timed_node("executor", executor_node))
+workflow.add_node("cosmos_order", timed_node("cosmos_order", cosmos_order_agent.node))
+workflow.add_node("cosmos_route", timed_node("cosmos_route", cosmos_route_agent.node))
+workflow.add_node("synthesizer", timed_node("synthesizer", synthesizer_node))
 workflow.add_edge(START, "planner")
 graph = workflow.compile()
 #
-# query = """
-# Calculate the average number of routes planned each calendar day for April 2026, do not return only the overall average and follow output example below. Visualize the results by a line chart.
-# <Example output from query>
-# April 8: 8 routes
-# April 10: 15 routes
-# <Example output from query>
-# """
 query = """
-Give me the number of routes for the request id: cd847bd2-84d1-4132-83b9-f36b3e490a66
+Calculate the average number of routes planned each calendar day for April 2026, do not return only the overall average and follow output example below. Visualize the results by a line chart.
+<Example output from query>
+April 8: 8 routes
+April 10: 15 routes
+<Example output from query>
 """
+# query = """
+# Give me the number of routes for the request id: cd847bd2-84d1-4132-83b9-f36b3e490a66
+# """
 state = {
     "messages": [HumanMessage(content=query)],
     "user_query": query,
-    "enabled_agents": ["cosmos_route"],
+    "enabled_agents": ["cosmos_route", "cosmos_order", "synthesizer"],
         }
 import base64
+_run_start = time.perf_counter()
 final_state = graph.invoke(state)
+_total = time.perf_counter() - _run_start
 final_answer = final_state["messages"][-1].content
 print(final_answer)
 print("--------------------------------")
 token_summary(final_state)
+timing_summary(final_state, _total)
 # Display the chart inline if the cosmos agent produced one
 chart_b64 = final_state.get("chart_b64")
-print(chart_b64)
 print("="*150)
 print(final_state)
 if chart_b64:

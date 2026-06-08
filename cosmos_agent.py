@@ -77,16 +77,24 @@ class CosmosRouteAgent:
             - order_number: Array (List of ARM numbers, e.g., ["ARM0000700"])
             - orderIds: Array of UUIDs
         """
+        query_rule = """
+            Cosmos Aggregate Query Rule:
+            Whenever COUNT, SUM, AVG, MIN, or MAX is used, generate:
+            SELECT VALUE <aggregate>
+            instead of:
+            SELECT <aggregate>
+            because queries are executed with enable_cross_partition_query=True.
+        """
         tools = self._get_tools()
         system_prompt = agent_system_prompt("""
             You are the Cosmos DB Expert for a logistics and routing system. When a user asks about route or output from the optimiser data,
-            Use the schema context as reference below and then use 'query_cosmos_db' to fetch the answer.
+            Use the schema context and query rules as reference below and then use 'query_cosmos_db' to fetch the answer.
             Provide a concise summary of the findings with plain text only, do not use markdown.
             While query: You have to use 'VALUE' with the aggregate for cross partition query,
             Order-by over correlated collections is not supported.
             If the user requests a chart or visualization, use 'python_repl_tool' to generate it
             with matplotlib and save it as a .png file in the current working directory.
-        """) + " " + schema_context
+        """) + " " + schema_context + " " + query_rule
         return create_agent(self.llm, tools=tools, system_prompt=system_prompt)
 
     def node(self, state):
@@ -119,7 +127,7 @@ class CosmosRouteAgent:
                 "messages": result["messages"],
                 "chart_b64": chart_b64,
             },
-            goto=END,
+            goto="executor"
         )
 
 
@@ -206,16 +214,24 @@ class CosmosOrderAgent:
             - Use JOIN e IN c.equipment_list when querying equipment-level data.
             - Aggregate metrics such as destination counts should typically be calculated from the order array.
         """
+        query_rule = """
+            Cosmos Aggregate Query Rule:
+            Whenever COUNT, SUM, AVG, MIN, or MAX is used, generate:
+            SELECT VALUE <aggregate>
+            instead of:
+            SELECT <aggregate>
+            because queries are executed with enable_cross_partition_query=True.
+        """
         tools = self._get_tools()
         system_prompt = agent_system_prompt("""
             You are the Cosmos DB Expert for a logistics and routing system. When a user asks about the request data used by the optimiser,
-            Use the schema context as reference below and then use 'query_cosmos_db' to fetch the answer.
+            Use the schema context and query rules as reference below and then use 'query_cosmos_db' to fetch the answer.
             Provide a concise summary of the findings with plain text only, do not use markdown.
             While query: You have to use 'VALUE' with the aggregate for cross partition query,
             Order-by over correlated collections is not supported.
             If the user requests a chart or visualization, use 'python_repl_tool' to generate it
             with matplotlib and save it as a .png file in the current working directory.
-        """) + " " + schema_context
+        """) + " " + schema_context + " " + query_rule
         return create_agent(self.llm, tools=tools, system_prompt=system_prompt)
 
     def node(self, state):
@@ -248,5 +264,5 @@ class CosmosOrderAgent:
                 "messages": result["messages"],
                 "chart_b64": chart_b64,
             },
-            goto=END,
+            goto="executor"
         )

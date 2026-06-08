@@ -6,8 +6,6 @@ from langgraph.graph import MessagesState
 from langgraph.types import Command
 from typing import Literal, Optional, List, Dict, Any, Type
 
-MAX_REPLANS = 2
-
 
 # Custom State class with specific keys
 class State(MessagesState):
@@ -286,7 +284,7 @@ def executor_prompt(state: State) -> HumanMessage:
 
     executor_prompt = f"""
         You are the **executor** in a multi‑agent system with these agents:
-        `{ '`, `'.join(sorted(set([a for a in _get_enabled_agents(state) if a in ['cosmos_route', 'cosmos_route', 'synthesizer']] + ['planner']))) }`.
+        `{ '`, `'.join(sorted(set([a for a in _get_enabled_agents(state) if a in ['cosmos_order', 'cosmos_route', 'synthesizer']] + ['planner']))) }`.
 
         **Tasks**
         1. Decide if the current plan needs revision.  → `"replan_flag": true|false`
