@@ -1,4 +1,6 @@
 import os
+import re
+import json
 import glob
 import base64
 from azure.cosmos import CosmosClient
@@ -7,8 +9,53 @@ from langchain_core.tools import tool
 from langchain.agents import create_agent
 from langgraph.types import Command
 from langgraph.graph import END
-from prompts import agent_system_prompt
+from prompts import agent_system_prompt, sum_token_usage
 from helper import python_repl_tool
+
+# Max serialized result payload returned to the LLM (~5k tokens at 4 chars/token)
+MAX_RESULT_CHARS = 20_000
+
+# Regex that matches whole-document selects the agent must never issue
+_WHOLE_DOC_RE = re.compile(
+    r"select\s+(\*|value\s+c\b|c\s+from)",
+    re.IGNORECASE,
+)
+
+
+def run_cosmos_query(container, query: str):
+    """
+    Execute a Cosmos DB SQL query with two enforcement guards:
+      1. Reject whole-document selects (SELECT *, SELECT c, SELECT VALUE c).
+      2. Reject results whose serialized payload exceeds MAX_RESULT_CHARS.
+    Returns the result list, or an error string the agent can act on.
+    """
+    normalized = re.sub(r"\s+", " ", query).strip()
+    if _WHOLE_DOC_RE.search(normalized):
+        return (
+            "Query rejected: whole-document selects are not allowed. "
+            "Project only the specific scalar fields you need "
+            "(e.g. SELECT c.id, c.col_date, ARRAY_LENGTH(c.routes)) "
+            "or use an aggregate (COUNT, SUM, AVG)."
+        )
+    try:
+        print(query)
+        results = list(
+            container.query_items(query=query, enable_cross_partition_query=True)
+        )
+    except Exception as e:
+        return f"Query failed: {str(e)}"
+
+    if not results:
+        return "No results found."
+
+    serialized = json.dumps(results, default=str)
+    if len(serialized) > MAX_RESULT_CHARS:
+        return (
+            f"Query rejected: result payload is {len(serialized):,} chars "
+            f"(limit {MAX_RESULT_CHARS:,}). "
+            "Add an aggregate (COUNT, SUM, AVG) or project fewer/shorter fields."
+        )
+    return results
 
 
 class CosmosRouteAgent:
@@ -34,17 +81,7 @@ class CosmosRouteAgent:
         @tool
         def query_cosmos_db(query: str):
             """Executes a cosmos query against the Azure Cosmos DB NoSQL container."""
-            # print(query)
-            # print("="*100)
-            try:
-                results = list(
-                    self.container.query_items(
-                        query=query, enable_cross_partition_query=True
-                    )
-                )
-                return results if results else "No results found."
-            except Exception as e:
-                return f"Query failed: {str(e)}"
+            return run_cosmos_query(self.container, query)
 
         return [query_cosmos_db, python_repl_tool]
 
@@ -93,7 +130,7 @@ class CosmosRouteAgent:
             While query: You have to use 'VALUE' with the aggregate for cross partition query,
             Order-by over correlated collections is not supported.
             If the user requests a chart or visualization, use 'python_repl_tool' to generate it
-            with matplotlib and save it as a .png file in the current working directory.
+            with matplotlib and save it as a .png file in the current working directory. Do not print or log anything.
         """) + " " + schema_context + " " + query_rule
         return create_agent(self.llm, tools=tools, system_prompt=system_prompt)
 
@@ -107,9 +144,10 @@ class CosmosRouteAgent:
 
         # Invoke the agent
         result = self.agent.invoke(state)
-        result["messages"][-1] = HumanMessage(
+        final_msg = HumanMessage(
             content=result["messages"][-1].content, name="cosmos_route"
         )
+        usage = sum_token_usage(result["messages"])
 
         # Detect newly created/modified PNG and base64-encode it for the front-end
         chart_b64 = None
@@ -123,9 +161,10 @@ class CosmosRouteAgent:
 
         return Command(
             update={
-                # share internal message history of research agent with other agents
-                "messages": result["messages"],
+                # emit only the final answer; internal ReAct transcript stays inside the agent
+                "messages": [final_msg],
                 "chart_b64": chart_b64,
+                "token_usage": [{"node": "cosmos_route", **usage}],
             },
             goto="executor"
         )
@@ -154,17 +193,7 @@ class CosmosOrderAgent:
         @tool
         def query_cosmos_db(query: str):
             """Executes a cosmos query against the Azure Cosmos DB NoSQL container."""
-            # print(query)
-            # print("="*100)
-            try:
-                results = list(
-                    self.container.query_items(
-                        query=query, enable_cross_partition_query=True
-                    )
-                )
-                return results if results else "No results found."
-            except Exception as e:
-                return f"Query failed: {str(e)}"
+            return run_cosmos_query(self.container, query)
 
         return [query_cosmos_db, python_repl_tool]
 
@@ -230,7 +259,7 @@ class CosmosOrderAgent:
             While query: You have to use 'VALUE' with the aggregate for cross partition query,
             Order-by over correlated collections is not supported.
             If the user requests a chart or visualization, use 'python_repl_tool' to generate it
-            with matplotlib and save it as a .png file in the current working directory.
+            with matplotlib and save it as a .png file in the current working directory. Do not print or log anything
         """) + " " + schema_context + " " + query_rule
         return create_agent(self.llm, tools=tools, system_prompt=system_prompt)
 
@@ -244,9 +273,10 @@ class CosmosOrderAgent:
 
         # Invoke the agent
         result = self.agent.invoke(state)
-        result["messages"][-1] = HumanMessage(
+        final_msg = HumanMessage(
             content=result["messages"][-1].content, name="cosmos_order"
         )
+        usage = sum_token_usage(result["messages"])
 
         # Detect newly created/modified PNG and base64-encode it for the front-end
         chart_b64 = None
@@ -260,9 +290,10 @@ class CosmosOrderAgent:
 
         return Command(
             update={
-                # share internal message history of research agent with other agents
-                "messages": result["messages"],
+                # emit only the final answer; internal ReAct transcript stays inside the agent
+                "messages": [final_msg],
                 "chart_b64": chart_b64,
+                "token_usage": [{"node": "cosmos_order", **usage}],
             },
             goto="executor"
         )
