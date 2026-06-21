@@ -22,6 +22,10 @@ warnings.filterwarnings(
 
 import os
 import re
+import glob
+import shutil
+import tempfile
+import asyncio
 import subprocess
 from dotenv import load_dotenv
 from langchain_core.tools import tool
@@ -33,49 +37,65 @@ os.environ["TRULENS_OTEL_TRACING"] = "1"
 # load full dotenv
 load_dotenv()
 repl = PythonREPL()
-@tool
-def python_repl_tool(
-    code: Annotated[str, "The python code to execute to generate your chart."],
-):
-    """Use this to execute python code. You will be used to execute python code that generates and display charts.
-    If using matplotlib to display chart, never call 'plt.show()' or show image to user.
-    """
-    # print("Executing code via subprocess:\n", code)
-    # Save the agent's code to a temporary file
-    with open("temp_agent_script.py", "w") as f:
-        f.write(code)
-    try:
-        # Run the script as a completely separate process
-        result = subprocess.run(
-            ["python3", "temp_agent_script.py"], 
-            capture_output=True, 
-            text=True,
-            check=True
-        )
-        output = result.stdout
-    except subprocess.CalledProcessError as e:
-        return f"Failed to execute. Error: {e.stderr}"
-    
-    return f"Successfully executed. Stdout: {output}"
 
 # @tool
 # def python_repl_tool(
 #     code: Annotated[str, "The python code to execute to generate your chart."],
 # ):
-    # """Use this to execute python code. You will be used to execute python code that generates and display charts.
-    # If using matplotlib to display chart, never call 'plt.show()'
-    # """
+#     """Use this to execute python code. You will be used to execute python code that generates and display charts.
+#     If using matplotlib to display chart, never call 'plt.show()' or show image to user.
+#     """
+#     # print("Executing code via subprocess:\n", code)
+#     # Save the agent's code to a temporary file
+#     with open("temp_agent_script.py", "w") as f:
+#         f.write(code)
 #     try:
-#         result = repl.run(code)
-#     except BaseException as e:
-#         return f"Failed to execute. Error: {repr(e)}"
-#     result_str = (
-#         f"Successfully executed:\n```python\n{code}\n```\nStdout: {result}"
-#     )
-#     return (
-#         result_str
-#         # + "\n\nIf you have completed all tasks, respond with FINAL ANSWER."
-#     )
+#         # Run the script as a completely separate process
+#         result = subprocess.run(
+#             ["python3", "temp_agent_script.py"], 
+#             capture_output=True, 
+#             text=True,
+#             check=True
+#         )
+#         output = result.stdout
+#     except subprocess.CalledProcessError as e:
+#         return f"Failed to execute. Error: {e.stderr}"
+    
+#     return f"Successfully executed. Stdout: {output}"
+
+@tool
+async def python_repl_tool(
+    code: Annotated[str, "The python code to execute to generate your chart."],
+):
+    """..."""
+    workdir = tempfile.mkdtemp(prefix="chart_")
+    script_path = os.path.join(workdir, "script.py")
+    with open(script_path, "w") as f:
+        f.write(code)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "python3", script_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=workdir,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            shutil.rmtree(workdir, ignore_errors=True)
+            return f"Failed to execute. Error: {stderr.decode()}"
+        output = stdout.decode()
+    except Exception as e:
+        shutil.rmtree(workdir, ignore_errors=True)
+        return f"Failed to execute. Error: {str(e)}"
+
+    pngs = glob.glob(os.path.join(workdir, "*.png"))
+    if pngs:
+        chart_path = max(pngs, key=os.path.getmtime)
+        return f"Successfully executed. CHART_PATH={chart_path}\nStdout: {output}"
+
+    shutil.rmtree(workdir, ignore_errors=True)
+    return f"Successfully executed. Stdout: {output}"
+
 
 from IPython.display import HTML, display
 def display_eval_reason(text, width=800):

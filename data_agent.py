@@ -3,6 +3,8 @@ import json
 import time
 import functools
 import operator
+import asyncio
+import inspect
 from typing import Annotated, Literal, Optional, List, Dict, Any, Type
 from langchain.agents import create_agent
 from langgraph.graph import MessagesState, END, START, StateGraph
@@ -10,14 +12,13 @@ from langgraph.types import Command
 from langchain_core.messages import BaseMessage, HumanMessage, ToolMessage
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI, AzureChatOpenAI
-from langchain_tavily import TavilySearch
-from langchain_community.utilities.tavily_search import TavilySearchAPIWrapper
-from langchain_community.tools.tavily_search import TavilySearchResults
+from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.prebuilt import ToolNode
 from llmclean import strip_fences
 import matplotlib.pyplot as plt
 from azure.cosmos import CosmosClient
 from cosmos_agent import CosmosRouteAgent, CosmosOrderAgent
+# from cosmos_agent_mcp import CosmosRouteAgent, CosmosOrderAgent
 from prompts import plan_prompt, executor_prompt, agent_system_prompt, sum_token_usage
 from helper import python_repl_tool
 
@@ -57,12 +58,12 @@ class State(MessagesState):
 
 
 #
-def planner_node(state: State) -> Command[Literal["executor"]]:
+async def planner_node(state: State) -> Command[Literal["executor"]]:
     """
     Runs the planning LLM and stores the resulting plan in state.
     """
     # 1. Invoke LLM with the planner prompt
-    llm_reply = reasoning_llm.invoke([plan_prompt(state)])
+    llm_reply = await reasoning_llm.ainvoke([plan_prompt(state)])
     output = llm_reply.content
     output = strip_fences(output)  # remove markdown json in the output
     # 2. Validate JSON
@@ -97,7 +98,7 @@ def planner_node(state: State) -> Command[Literal["executor"]]:
 
 
 #
-def executor_node(
+async def executor_node(
     state: State, MAX_REPLANS=3
 ) -> Command[Literal["planner", "cosmos_order", "cosmos_route", "synthesizer"]]:
 
@@ -120,7 +121,7 @@ def executor_node(
         )
 
     # 1) Build prompt & call LLM
-    llm_reply = reasoning_llm.invoke([executor_prompt(state)])
+    llm_reply = await reasoning_llm.ainvoke([executor_prompt(state)])
     output = llm_reply.content
     output = strip_fences(output)  # remove markdown json in the output
     try:
@@ -171,7 +172,7 @@ def executor_node(
 
 
 #
-def synthesizer_node(state: State) -> Command[Literal[END]]:
+async def synthesizer_node(state: State) -> Command[Literal[END]]:
     """
     Creates a concise, human‑readable summary of the entire interaction, **purely in prose**.
     It ignores structured tables or chart IDs and instead rewrites the relevant agent messages (research results, chart commentary, etc.) into a short final answer.
@@ -208,10 +209,13 @@ def synthesizer_node(state: State) -> Command[Literal[END]]:
         )
     ]
 
-    llm_reply = reasoning_llm.invoke(summary_prompt)
+    # Use AWAIT and AINVOKE here with the tracking tag for our event stream
+    llm_reply = await reasoning_llm.ainvoke(
+        summary_prompt,
+        config={"tags": ["final_synthesis"]}
+    )
 
     answer = llm_reply.content.strip()
-    # print(f"Synthesizer answer: {answer}")
 
     return Command(
         update={
@@ -226,7 +230,7 @@ def synthesizer_node(state: State) -> Command[Literal[END]]:
 #
 def token_summary(final_state):
     records = final_state.get("token_usage") or []
-    print("--- Token Usage by Node ---")
+    print("\n--- Token Usage by Node ---")
     for rec in records:
         print(
             f"  {rec['node']}: in={rec.get('input_tokens', 0):,}  out={rec.get('output_tokens', 0):,}"
@@ -241,27 +245,41 @@ def token_summary(final_state):
 
 #
 def timed_node(name: str, fn):
-    """Wraps a node function to record its wall-clock execution time into state."""
-
-    @functools.wraps(fn)
-    def wrapper(state):
-        start = time.perf_counter()
-        result = fn(state)
-        elapsed = time.perf_counter() - start
-        print(f"[timing] {name}: {elapsed:.2f}s")
-        if isinstance(result, Command):
-            if result.update is None:
-                result.update = {}
-            result.update["node_timings"] = [{"node": name, "seconds": elapsed}]
-        return result
-
-    return wrapper
+    """Wraps a node function to record its wall-clock execution time into state.
+       Updated to handle both sync and async nodes dynamically."""
+    
+    if inspect.iscoroutinefunction(fn):
+        @functools.wraps(fn)
+        async def async_wrapper(state):
+            start = time.perf_counter()
+            result = await fn(state)
+            elapsed = time.perf_counter() - start
+            print(f"[timing] {name}: {elapsed:.2f}s")
+            if isinstance(result, Command):
+                if result.update is None:
+                    result.update = {}
+                result.update["node_timings"] = [{"node": name, "seconds": elapsed}]
+            return result
+        return async_wrapper
+    else:
+        @functools.wraps(fn)
+        def sync_wrapper(state):
+            start = time.perf_counter()
+            result = fn(state)
+            elapsed = time.perf_counter() - start
+            print(f"[timing] {name}: {elapsed:.2f}s")
+            if isinstance(result, Command):
+                if result.update is None:
+                    result.update = {}
+                result.update["node_timings"] = [{"node": name, "seconds": elapsed}]
+            return result
+        return sync_wrapper
 
 
 #
 def timing_summary(final_state, total_seconds=None):
     timings = final_state.get("node_timings") or []
-    print("--- Node Execution Times ---")
+    print("\n--- Node Execution Times ---")
     for rec in timings:
         print(f"{rec['node']}: {rec['seconds']:.2f}s")
     print(f"Sum of node times: {sum(r['seconds'] for r in timings):.2f}s")
@@ -269,36 +287,55 @@ def timing_summary(final_state, total_seconds=None):
         print(f"Total run time:    {total_seconds:.2f}s")
 
 
-if __name__ == "__main__":
+async def main():
     KEY = os.getenv("cosmos_key")
     ENDPOINT = os.getenv("cosmos_url")
     openai_key = os.getenv("gemini_key")
     azure_openai_key = os.getenv("azure_openai_key")
     tavily_key = os.getenv("tavily_key")
-    #
+    use_mcp = False
+    
+    # Needs to be global so synthesizer_node can access it
+    global reasoning_llm
     reasoning_llm = ChatOpenAI(
-        model="DeepSeek-V4-Pro",  # DeepSeek-V4-Pro, DeepSeek-V4-Flash
+        model="DeepSeek-V4-Pro",  
         base_url="https://3t-ai-resource.services.ai.azure.com/openai/v1",
         api_key=azure_openai_key,
         max_tokens=2048,
         temperature=0.1,
     )
-    #
-    cosmos_order_agent = CosmosOrderAgent(
-        endpoint=ENDPOINT,
-        key=KEY,
-        database_name="hgs-input",
-        container_name="orders",
-        llm=reasoning_llm,
-    )
 
-    cosmos_route_agent = CosmosRouteAgent(
-        endpoint=ENDPOINT,
-        key=KEY,
-        database_name="hgs-output",
-        container_name="route",
-        llm=reasoning_llm,
-    )
+    #
+    if use_mcp:
+        mcp_client = MultiServerMCPClient({
+            "cosmos": {
+                "command": "python3",
+                "args": [os.path.join(os.path.dirname(__file__), "mcp_server.py")],
+                "transport": "stdio",
+            }
+        })
+        mcp_tools = await mcp_client.get_tools()
+        route_tool = next(t for t in mcp_tools if t.name == "query_route_data")
+        order_tool = next(t for t in mcp_tools if t.name == "query_order_data")
+        cosmos_order_agent = CosmosOrderAgent(llm=reasoning_llm, query_tool=order_tool)
+        cosmos_route_agent = CosmosRouteAgent(llm=reasoning_llm, query_tool=route_tool)
+    else:
+        cosmos_order_agent = CosmosOrderAgent(
+            endpoint=ENDPOINT,
+            key=KEY,
+            database_name="hgs-input",
+            container_name="orders",
+            llm=reasoning_llm,
+        )
+
+        cosmos_route_agent = CosmosRouteAgent(
+            endpoint=ENDPOINT,
+            key=KEY,
+            database_name="hgs-output",
+            container_name="route",
+            llm=reasoning_llm,
+        )
+
     #
     workflow = StateGraph(State)
     workflow.add_node("planner", timed_node("planner", planner_node))
@@ -320,35 +357,64 @@ if __name__ == "__main__":
     April 10: 15 routes
     <Example output from query>
     """
-    # query = """
-    # Give me the number of routes for the request id: cd847bd2-84d1-4132-83b9-f36b3e490a66
-    # """
+    
     state = {
         "messages": [HumanMessage(content=query)],
         "user_query": query,
         "enabled_agents": ["cosmos_route", "cosmos_order", "synthesizer"],
     }
+    
     import base64
 
     _run_start = time.perf_counter()
-    final_state = graph.invoke(state)
+    final_state = None
+    
+    print("\nProcessing agents... please wait.")
+    print("\n--- Final Answer ---\n")
+    
+    # Stream events from the graph
+    async for event in graph.astream_events(state, version="v2"):
+        kind = event["event"]
+        tags = event.get("tags", [])
+        
+        # 1. Stream the Agent steps (UX Improvement)
+        if kind == "on_chain_start" and event["name"] in ["planner", "executor", "cosmos_order", "cosmos_route"]:
+            print(f"\n[System: Running {event['name'].replace('_', ' ').title()}...]", flush=True)
+            # In a real app, you would yield this as a UI status badge to your frontend
+
+        # 2. Stream our final synthesis text chunk by chunk
+        elif kind == "on_chat_model_stream" and "final_synthesis" in event.get("tags", []):
+            chunk = event["data"]["chunk"]
+            print(chunk.content, end="", flush=True)
+            
+        # 2. Capture the graph's final state dictionary on completion
+        if kind == "on_chain_end" and event["name"] == "LangGraph":
+            final_state = event["data"].get("output")
+            
     _total = time.perf_counter() - _run_start
-    final_answer = final_state["messages"][-1].content
-    print(final_answer)
-    print("--------------------------------")
-    token_summary(final_state)
-    timing_summary(final_state, _total)
-    # Display the chart inline if the cosmos agent produced one
-    chart_b64 = final_state.get("chart_b64")
-    print("=" * 150)
-    print(final_state)
-    if chart_b64:
-        chart_path = os.path.join(os.path.dirname(__file__), "chart_output.png")
-        with open(chart_path, "wb") as f:
-            f.write(base64.b64decode(chart_b64.split(",", 1)[1]))
-        print(f"\n--- Chart saved to {chart_path} ---")
-        img = plt.imread(chart_path)
-        plt.imshow(img)
-        plt.show()
+    print("\n\n--------------------------------")
+    
+    if final_state:
+        token_summary(final_state)
+        timing_summary(final_state, _total)
+        
+        # Display the chart inline if the cosmos agent produced one
+        chart_b64 = final_state.get("chart_b64")
+        print("=" * 150)
+        
+        if chart_b64:
+            chart_path = os.path.join(os.path.dirname(__file__), "chart_output.png")
+            with open(chart_path, "wb") as f:
+                f.write(base64.b64decode(chart_b64.split(",", 1)[1]))
+            print(f"\n--- Chart saved to {chart_path} ---")
+            img = plt.imread(chart_path)
+            plt.imshow(img)
+            plt.show()
+        else:
+            print("(No chart produced)")
     else:
-        print("(No chart produced)")
+        print("Error: Could not capture final state from graph stream.")
+
+if __name__ == "__main__":
+    # Execute the asynchronous main flow
+    asyncio.run(main())

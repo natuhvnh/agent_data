@@ -3,7 +3,9 @@ import re
 import json
 import glob
 import base64
-from azure.cosmos import CosmosClient
+import shutil
+# from azure.cosmos import CosmosClient
+from azure.cosmos.aio import CosmosClient   # async client
 from langchain_core.messages import HumanMessage
 from langchain_core.tools import tool
 from langchain.agents import create_agent
@@ -22,26 +24,15 @@ _WHOLE_DOC_RE = re.compile(
 )
 
 
-def run_cosmos_query(container, query: str):
-    """
-    Execute a Cosmos DB SQL query with two enforcement guards:
-      1. Reject whole-document selects (SELECT *, SELECT c, SELECT VALUE c).
-      2. Reject results whose serialized payload exceeds MAX_RESULT_CHARS.
-    Returns the result list, or an error string the agent can act on.
-    """
+async def run_cosmos_query(container, query: str):
+    """Async version — awaits the query iterator."""
     normalized = re.sub(r"\s+", " ", query).strip()
     if _WHOLE_DOC_RE.search(normalized):
-        return (
-            "Query rejected: whole-document selects are not allowed. "
-            "Project only the specific scalar fields you need "
-            "(e.g. SELECT c.id, c.col_date, ARRAY_LENGTH(c.routes)) "
-            "or use an aggregate (COUNT, SUM, AVG)."
-        )
+        return "Query rejected: ..."
     try:
-        print(query)
-        results = list(
-            container.query_items(query=query, enable_cross_partition_query=True)
-        )
+        results = []
+        async for item in container.query_items(query=query):
+            results.append(item)
     except Exception as e:
         return f"Query failed: {str(e)}"
 
@@ -50,11 +41,7 @@ def run_cosmos_query(container, query: str):
 
     serialized = json.dumps(results, default=str)
     if len(serialized) > MAX_RESULT_CHARS:
-        return (
-            f"Query rejected: result payload is {len(serialized):,} chars "
-            f"(limit {MAX_RESULT_CHARS:,}). "
-            "Add an aggregate (COUNT, SUM, AVG) or project fewer/shorter fields."
-        )
+        return "Query rejected: result too large. ..."
     return results
 
 
@@ -79,9 +66,9 @@ class CosmosRouteAgent:
         """
 
         @tool
-        def query_cosmos_db(query: str):
+        async def query_cosmos_db(query: str):
             """Executes a cosmos query against the Azure Cosmos DB NoSQL container."""
-            return run_cosmos_query(self.container, query)
+            return await run_cosmos_query(self.container, query)
 
         return [query_cosmos_db, python_repl_tool]
 
@@ -134,16 +121,13 @@ class CosmosRouteAgent:
         """) + " " + schema_context + " " + query_rule
         return create_agent(self.llm, tools=tools, system_prompt=system_prompt)
 
-    def node(self, state):
+    async def node(self, state):
         """
         The graph node function. It invokes the internal agent and
         returns a Command to update the state and route the graph.
         """
-        # Snapshot PNGs before invocation so we can detect any new file afterward
-        before = {p: os.path.getmtime(p) for p in glob.glob("*.png")}
-
         # Invoke the agent
-        result = self.agent.invoke(state)
+        result = await self.agent.ainvoke(state)
         final_msg = HumanMessage(
             content=result["messages"][-1].content, name="cosmos_route"
         )
@@ -151,13 +135,22 @@ class CosmosRouteAgent:
 
         # Detect newly created/modified PNG and base64-encode it for the front-end
         chart_b64 = None
-        new = [p for p in glob.glob("*.png")
-               if p not in before or os.path.getmtime(p) > before[p]]
-        if new:
-            latest = max(new, key=os.path.getmtime)
-            with open(latest, "rb") as f:
-                chart_b64 = "data:image/png;base64," + base64.b64encode(f.read()).decode()
-            os.remove(latest)  # clean up ephemeral disk; remove this line to keep the file
+        chart_workdir = None
+        for msg in result["messages"]:
+            # ToolMessage content from python_repl_tool
+            content = getattr(msg, "content", "") or ""
+            m = re.search(r"CHART_PATH=(.+?)(\n|$)", content)
+            if m:
+                chart_path = m.group(1).strip()
+                chart_workdir = os.path.dirname(chart_path)
+                if os.path.exists(chart_path):
+                    with open(chart_path, "rb") as f:
+                        chart_b64 = "data:image/png;base64," + base64.b64encode(f.read()).decode()
+                break  # use the last/only chart
+
+        # Clean up the isolated temp dir
+        if chart_workdir:
+            shutil.rmtree(chart_workdir, ignore_errors=True)
 
         return Command(
             update={
@@ -191,9 +184,9 @@ class CosmosOrderAgent:
         """
 
         @tool
-        def query_cosmos_db(query: str):
+        async def query_cosmos_db(query: str):
             """Executes a cosmos query against the Azure Cosmos DB NoSQL container."""
-            return run_cosmos_query(self.container, query)
+            return await run_cosmos_query(self.container, query)
 
         return [query_cosmos_db, python_repl_tool]
 
@@ -263,16 +256,13 @@ class CosmosOrderAgent:
         """) + " " + schema_context + " " + query_rule
         return create_agent(self.llm, tools=tools, system_prompt=system_prompt)
 
-    def node(self, state):
+    async def node(self, state):
         """
         The graph node function. It invokes the internal agent and
         returns a Command to update the state and route the graph.
         """
-        # Snapshot PNGs before invocation so we can detect any new file afterward
-        before = {p: os.path.getmtime(p) for p in glob.glob("*.png")}
-
         # Invoke the agent
-        result = self.agent.invoke(state)
+        result = await self.agent.ainvoke(state)
         final_msg = HumanMessage(
             content=result["messages"][-1].content, name="cosmos_order"
         )
@@ -280,14 +270,22 @@ class CosmosOrderAgent:
 
         # Detect newly created/modified PNG and base64-encode it for the front-end
         chart_b64 = None
-        new = [p for p in glob.glob("*.png")
-               if p not in before or os.path.getmtime(p) > before[p]]
-        if new:
-            latest = max(new, key=os.path.getmtime)
-            with open(latest, "rb") as f:
-                chart_b64 = "data:image/png;base64," + base64.b64encode(f.read()).decode()
-            os.remove(latest)  # clean up ephemeral disk; remove this line to keep the file
+        chart_workdir = None
+        for msg in result["messages"]:
+            # ToolMessage content from python_repl_tool
+            content = getattr(msg, "content", "") or ""
+            m = re.search(r"CHART_PATH=(.+?)(\n|$)", content)
+            if m:
+                chart_path = m.group(1).strip()
+                chart_workdir = os.path.dirname(chart_path)
+                if os.path.exists(chart_path):
+                    with open(chart_path, "rb") as f:
+                        chart_b64 = "data:image/png;base64," + base64.b64encode(f.read()).decode()
+                break  # use the last/only chart
 
+        # Clean up the isolated temp dir
+        if chart_workdir:
+            shutil.rmtree(chart_workdir, ignore_errors=True)
         return Command(
             update={
                 # emit only the final answer; internal ReAct transcript stays inside the agent
