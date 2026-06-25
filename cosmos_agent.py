@@ -28,7 +28,11 @@ async def run_cosmos_query(container, query: str):
     """Async version — awaits the query iterator."""
     normalized = re.sub(r"\s+", " ", query).strip()
     if _WHOLE_DOC_RE.search(normalized):
-        return "Query rejected: ..."
+        return (
+            "Query rejected: whole-document selects (SELECT *, SELECT VALUE c, SELECT c FROM) "
+            "are not allowed. Use specific field projections or aggregate functions "
+            "(SELECT VALUE COUNT(1), SELECT c.col_date, c.routes FROM c, etc.)."
+        )
     try:
         results = []
         async for item in container.query_items(query=query):
@@ -41,7 +45,11 @@ async def run_cosmos_query(container, query: str):
 
     serialized = json.dumps(results, default=str)
     if len(serialized) > MAX_RESULT_CHARS:
-        return "Query rejected: result too large. ..."
+        return (
+            "Query rejected: result payload exceeds the safe limit. "
+            "Narrow the query with a WHERE clause, use aggregate functions "
+            "(COUNT, SUM, AVG), or project only the fields you need."
+        )
     return results
 
 
@@ -121,13 +129,32 @@ class CosmosRouteAgent:
         """) + " " + schema_context + " " + query_rule
         return create_agent(self.llm, tools=tools, system_prompt=system_prompt)
 
+    async def aclose(self):
+        """Close the underlying async Cosmos client to avoid connection leaks."""
+        await self.client.close()
+
     async def node(self, state):
         """
         The graph node function. It invokes the internal agent and
         returns a Command to update the state and route the graph.
         """
-        # Invoke the agent
-        result = await self.agent.ainvoke(state)
+        # Scope the sub-agent to the executor's per-step instruction to prevent it from
+        # seeing the full transcript and over-answering (e.g. returning all months in step 1).
+        # Also pass the original user_query as read-only context so output-format / visualization
+        # requirements (e.g. "line chart") survive — but guard against scope expansion.
+        agent_query = state.get("agent_query") or state["messages"][-1].content
+        user_query = state.get("user_query") or ""
+        if user_query.strip() and user_query.strip() != agent_query.strip():
+            instruction = (
+                f"Task for this step: {agent_query}\n\n"
+                f"The user's overall request is below. Use it ONLY to honor output-format and "
+                f"visualization requirements (e.g. chart type, plain-text formatting). "
+                f"Do NOT expand the data scope beyond the task above.\n"
+                f"User request: {user_query}"
+            )
+        else:
+            instruction = agent_query
+        result = await self.agent.ainvoke({"messages": [HumanMessage(content=instruction)]})
         final_msg = HumanMessage(
             content=result["messages"][-1].content, name="cosmos_route"
         )
@@ -256,13 +283,32 @@ class CosmosOrderAgent:
         """) + " " + schema_context + " " + query_rule
         return create_agent(self.llm, tools=tools, system_prompt=system_prompt)
 
+    async def aclose(self):
+        """Close the underlying async Cosmos client to avoid connection leaks."""
+        await self.client.close()
+
     async def node(self, state):
         """
         The graph node function. It invokes the internal agent and
         returns a Command to update the state and route the graph.
         """
-        # Invoke the agent
-        result = await self.agent.ainvoke(state)
+        # Scope the sub-agent to the executor's per-step instruction to prevent it from
+        # seeing the full transcript and over-answering (e.g. returning all months in step 1).
+        # Also pass the original user_query as read-only context so output-format / visualization
+        # requirements (e.g. "line chart") survive — but guard against scope expansion.
+        agent_query = state.get("agent_query") or state["messages"][-1].content
+        user_query = state.get("user_query") or ""
+        if user_query.strip() and user_query.strip() != agent_query.strip():
+            instruction = (
+                f"Task for this step: {agent_query}\n\n"
+                f"The user's overall request is below. Use it ONLY to honor output-format and "
+                f"visualization requirements (e.g. chart type, plain-text formatting). "
+                f"Do NOT expand the data scope beyond the task above.\n"
+                f"User request: {user_query}"
+            )
+        else:
+            instruction = agent_query
+        result = await self.agent.ainvoke({"messages": [HumanMessage(content=instruction)]})
         final_msg = HumanMessage(
             content=result["messages"][-1].content, name="cosmos_order"
         )

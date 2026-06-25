@@ -5,6 +5,7 @@ from typing import Optional
 from langgraph.graph import MessagesState
 from langgraph.types import Command
 from typing import Literal, Optional, List, Dict, Any, Type
+from state_message import State
 
 
 def sum_token_usage(messages) -> Dict[str, int]:
@@ -26,20 +27,6 @@ def sum_token_usage(messages) -> Dict[str, int]:
             input_tokens += usage.get("prompt_tokens", 0)
             output_tokens += usage.get("completion_tokens", 0)
     return {"input_tokens": input_tokens, "output_tokens": output_tokens}
-
-
-# Custom State class with specific keys
-class State(MessagesState):
-    enabled_agents: Optional[List[str]]
-    # Current plan only: mapping from step number (as string) to step definition
-    plan: Optional[Dict[str, Dict[str, Any]]]
-    user_query: Optional[str]
-    current_step: int
-    replan_flag: Optional[bool]
-    last_reason: Optional[str]
-    # Replan attempts tracked per step number
-    replan_attempts: Optional[Dict[int, int]]
-    agent_query: Optional[str]
 
 
 MAX_REPLANS = 2
@@ -208,6 +195,32 @@ def format_agent_guidelines_for_executor(state: State | None = None) -> str:
     return "\n".join(guidelines)
 
 
+def _build_conversation_context(state) -> str:
+    """Build a compact conversation context block for the planner."""
+    WINDOW_K = 3          # turns to keep in the active window
+    parts = []
+
+    running_summary = state.get("running_summary")
+    if running_summary:
+        parts.append(f"[Summary of prior conversation]\n{running_summary}")
+
+    chat_history = state.get("chat_history") or []
+    # Only last WINDOW_K turns
+    window = chat_history[-(WINDOW_K * 2):]
+    if window:
+        turns_text = "\n".join(
+            f"  {t['role'].upper()}: {t['content']}" for t in window
+        )
+        parts.append(f"[Recent conversation]\n{turns_text}")
+
+    long_term = state.get("long_term_memories") or []
+    if long_term:
+        facts_text = "\n".join(f"  - {f}" for f in long_term)
+        parts.append(f"[User preferences / long-term memory]\n{facts_text}")
+
+    return "\n\n".join(parts)
+
+
 def plan_prompt(state: State) -> HumanMessage:
     """
     Build the prompt that instructs the LLM to return a high‑level plan.
@@ -275,10 +288,13 @@ def plan_prompt(state: State) -> HumanMessage:
 
     else:
         prompt += "\nGenerate a new plan from scratch."
-
-    prompt += f'\nUser query: "{user_query}"'
-
-    return HumanMessage(content=prompt)
+    conv_context = _build_conversation_context(state)
+    if conv_context:
+        prompt_content = f"Conversation context:\n{conv_context}\n\n---\n\n{prompt}"
+    else:
+        prompt_content = prompt
+    prompt_content += f'\nUser query: "{user_query}"'
+    return HumanMessage(content=prompt_content)
 
 
 def executor_prompt(state: State) -> HumanMessage:

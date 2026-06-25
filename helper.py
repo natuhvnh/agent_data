@@ -67,7 +67,8 @@ repl = PythonREPL()
 async def python_repl_tool(
     code: Annotated[str, "The python code to execute to generate your chart."],
 ):
-    """..."""
+    """Execute Python code to generate a matplotlib chart and save it as a .png file.
+    Never call plt.show() or display the image inline. Do not print or log anything."""
     workdir = tempfile.mkdtemp(prefix="chart_")
     script_path = os.path.join(workdir, "script.py")
     with open(script_path, "w") as f:
